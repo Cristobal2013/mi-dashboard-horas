@@ -5,152 +5,225 @@ import plotly.graph_objects as go
 
 # Configuración de la página
 st.set_page_config(
-    page_title="Dashboard Dinámico de Excel",
-    page_icon="📊",
+    page_title="Dashboard Ejecutivo de Horas",
+    page_icon="💼",
     layout="wide"
 )
 
-# Estilo personalizado
+# Estilo personalizado para un look más "Ejecutivo"
 st.markdown("""
     <style>
-    .main { background-color: #f8f9fa; }
+    .main { background-color: #f4f6f9; }
+    h1, h2, h3 { color: #2c3e50; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
     .stMetric {
         background-color: #ffffff;
-        padding: 15px;
-        border-radius: 10px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        padding: 20px;
+        border-radius: 12px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+        border-left: 5px solid #2980b9;
     }
+    .stMetric label { color: #7f8c8d !important; font-size: 16px !important; font-weight: 600; }
+    .stMetric [data-testid="stMetricValue"] { color: #2c3e50; font-size: 32px; font-weight: bold; }
     </style>
     """, unsafe_allow_html=True)
 
-@st.cache_data(show_spinner="Analizando archivo...")
-def procesar_archivo(uploaded_file):
-    """Lee el archivo y detecta automáticamente dónde empieza la tabla real"""
+@st.cache_data(show_spinner="Analizando estructura del reporte...")
+def procesar_archivo_ejecutivo(uploaded_file):
+    """Lógica avanzada para leer reportes matriciales (ej. exportaciones de Salesforce)"""
     try:
-        # Leemos las primeras 50 líneas para entender la estructura
-        if uploaded_file.name.endswith('.csv'):
-            df_raw = pd.read_csv(uploaded_file, header=None, nrows=50)
+        is_csv = uploaded_file.name.endswith('.csv')
+        
+        # 1. Leer primeras líneas para encontrar dónde empieza la tabla
+        if is_csv:
+            df_raw = pd.read_csv(uploaded_file, header=None, nrows=30)
         else:
-            df_raw = pd.read_excel(uploaded_file, header=None, nrows=50)
+            df_raw = pd.read_excel(uploaded_file, header=None, nrows=30)
             
-        # Buscamos la fila que tenga la mayor cantidad de columnas con datos
-        # (Esto suele ser la fila de los encabezados reales de la tabla)
         header_idx = 0
-        max_cols = 0
         for i, row in df_raw.iterrows():
-            non_nulls = row.notna().sum()
-            if non_nulls > max_cols:
-                max_cols = non_nulls
+            if row.astype(str).str.contains('Owner Name|Nombre', case=False, na=False).any():
                 header_idx = i
+                break
                 
-        # Reiniciamos el archivo y leemos saltando las filas de títulos superiores
+        # 2. Verificar si es un reporte con doble encabezado (Work Type arriba, Métricas abajo)
+        is_multi = False
+        if header_idx > 0:
+            prev_row = df_raw.iloc[header_idx - 1].astype(str).str.lower()
+            if prev_row.str.contains('work type|billable|tipo').any():
+                is_multi = True
+                
         uploaded_file.seek(0)
-        if uploaded_file.name.endswith('.csv'):
-            df = pd.read_csv(uploaded_file, skiprows=header_idx)
-        else:
-            df = pd.read_excel(uploaded_file, skiprows=header_idx)
+        
+        # 3. Leer y aplanar encabezados (Ej: convierte "Billable" y "Hours" a "Billable - Hours")
+        if is_multi:
+            if is_csv:
+                df = pd.read_csv(uploaded_file, skiprows=header_idx-1, header=[0, 1])
+            else:
+                df = pd.read_excel(uploaded_file, skiprows=header_idx-1, header=[0, 1])
             
-        # Limpiamos los nombres de las columnas de caracteres raros (como flechas) y espacios
-        df.columns = df.columns.astype(str).str.replace('↑', '').str.replace('→', '').str.strip()
+            cols_l0 = pd.Series(df.columns.get_level_values(0)).replace(r'^Unnamed:.*', pd.NA, regex=True).ffill()
+            cols_l1 = df.columns.get_level_values(1)
+            
+            new_cols = []
+            for c0, c1 in zip(cols_l0, cols_l1):
+                c0_clean = str(c0).replace('→', '').replace('↑', '').strip()
+                c1_clean = str(c1).replace('→', '').replace('↑', '').strip()
+                
+                if pd.isna(c0) or c0_clean == '' or 'unnamed' in c0_clean.lower() or c0_clean.lower() == c1_clean.lower():
+                    new_cols.append(c1_clean)
+                else:
+                    new_cols.append(f"{c0_clean} - {c1_clean}")
+            df.columns = new_cols
+        else:
+            if is_csv:
+                df = pd.read_csv(uploaded_file, skiprows=header_idx)
+            else:
+                df = pd.read_excel(uploaded_file, skiprows=header_idx)
+            df.columns = df.columns.astype(str).str.replace('↑', '').str.replace('→', '').str.strip()
+            
+        # 4. Limpieza final de datos
+        df = df.dropna(how='all', axis=1) # Quitar columnas 100% vacías
         
-        # Eliminamos columnas que estén 100% vacías
-        df = df.dropna(how='all', axis=1)
-        
-        # Convertimos a numérico lo que parezca número (para que los gráficos funcionen)
+        owner_col = next((c for c in df.columns if 'owner name' in c.lower() or 'nombre' in c.lower()), None)
+        if owner_col:
+            # Eliminar filas de "Subtotal" y "Total" que ensucian los gráficos
+            df = df[~df[owner_col].astype(str).str.contains('Subtotal|Total', case=False, na=False)]
+            df = df.dropna(subset=[owner_col])
+            
+        # Convertir todo lo que sea número a formato numérico real
         for col in df.columns:
             try:
-                # Intenta convertir a número ignorando los errores en textos
-                df_numeric = pd.to_numeric(df[col], errors='coerce')
-                # Si al menos el 20% de la columna son números, la consideramos numérica
-                if df_numeric.notna().mean() > 0.2:
-                    df[col] = df_numeric
+                df_numeric = pd.to_numeric(df[col].astype(str).str.replace(',', ''), errors='coerce')
+                if df_numeric.notna().mean() > 0.05:
+                    df[col] = df_numeric.fillna(0)
             except:
                 pass
                 
-        return df
+        return df, owner_col
     except Exception as e:
-        st.error(f"Error al leer el archivo: {e}")
-        return pd.DataFrame()
+        st.error(f"Error procesando archivo: {e}")
+        return pd.DataFrame(), None
 
 def main():
-    st.title("📊 Dashboard Dinámico de Datos")
-    st.markdown("Carga tu archivo y el sistema detectará automáticamente tus columnas.")
+    st.title("💼 Dashboard Ejecutivo de Rendimiento")
+    st.markdown("Visualización de **Team Utilization**, **Billable** y **Non-Billable** extraídos automáticamente de tu reporte.")
     
-    st.sidebar.header("📁 Carga de Archivo")
-    uploaded_file = st.sidebar.file_uploader("Sube tu archivo Excel o CSV", type=["xlsx", "csv"])
+    st.sidebar.header("📁 Carga de Reporte")
+    uploaded_file = st.sidebar.file_uploader("Sube tu exportación (Excel o CSV)", type=["xlsx", "csv"])
 
     if uploaded_file is not None:
-        # 1. Cargar datos inteligentemente
-        df = procesar_archivo(uploaded_file)
+        df, owner_col = procesar_archivo_ejecutivo(uploaded_file)
         
-        if df.empty:
+        if df.empty or not owner_col:
+            st.error("No se encontraron datos válidos. Asegúrate de que el archivo contiene la columna 'Owner Name'.")
             return
 
-        # 2. Mostrar la tabla real extraída
-        st.subheader("📋 Datos Extraídos de tu Archivo")
-        st.markdown(f"Se encontraron **{len(df)} filas** y **{len(df.columns)} columnas** útiles.")
-        st.dataframe(df, use_container_width=True)
+        # --- AUTO-DETECCIÓN DE MÉTRICAS CLAVE ---
+        # Buscar la columna de Utilización Total (Generalmente "Total - Team Utilization")
+        col_utilization = next((c for c in df.columns if 'total - team utilization' in c.lower()), None)
+        if not col_utilization:
+            col_utilization = next((c for c in df.columns if 'team utilization' in c.lower()), None)
+
+        # Buscar columnas Billable / Non-Billable (Generalmente "Billable - Total Billable Hours")
+        col_billable = next((c for c in df.columns if 'billable - total' in c.lower() and 'non' not in c.lower()), None)
+        col_non_billable = next((c for c in df.columns if 'non-billable - total' in c.lower()), None)
+        
+        # Fallbacks por si cambian de nombre en el Excel
+        if not col_billable: col_billable = next((c for c in df.columns if 'billable' in c.lower() and 'non' not in c.lower() and 'hour' in c.lower()), None)
+        if not col_non_billable: col_non_billable = next((c for c in df.columns if 'non-billable' in c.lower() and 'hour' in c.lower()), None)
+
+        # --- SECCIÓN: KPIs EJECUTIVOS ---
+        st.markdown("### 📊 Indicadores Clave del Equipo")
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            total_empleados = df[owner_col].nunique()
+            st.metric("Miembros del Equipo", total_empleados)
+            
+        with col2:
+            if col_utilization:
+                avg_util = df[col_utilization].mean() * 100 # Convertir decimal a porcentaje
+                st.metric("Team Utilization Promedio", f"{avg_util:.1f}%")
+            else:
+                st.metric("Team Utilization", "N/A")
+                
+        with col3:
+            if col_billable:
+                tot_bill = df[col_billable].sum()
+                st.metric("Total Billable (Hrs)", f"{tot_bill:,.1f}")
+            else:
+                st.metric("Total Billable", "N/A")
+                
+        with col4:
+            if col_non_billable:
+                tot_non_bill = df[col_non_billable].sum()
+                st.metric("Total Non-Billable (Hrs)", f"{tot_non_bill:,.1f}")
+            else:
+                st.metric("Total Non-Billable", "N/A")
 
         st.markdown("---")
-        
-        # 3. Graficador dinámico basado en las columnas que EXISTEN
-        st.subheader("📈 Analiza tus Datos")
-        
-        # Separar columnas por tipo para facilitar la selección
-        cols_texto = df.select_dtypes(include=['object', 'string']).columns.tolist()
-        cols_numeros = df.select_dtypes(include=['number']).columns.tolist()
-        
-        # Si pandas no detectó bien los tipos, usamos todas
-        if not cols_texto: cols_texto = list(df.columns)
-        if not cols_numeros: cols_numeros = list(df.columns)
 
-        # Buscar valores por defecto lógicos para tu archivo específico
-        def_agrupar = next((c for c in cols_texto if 'name' in c.lower() or 'nombre' in c.lower()), cols_texto[0])
-        def_graficar = [c for c in cols_numeros if 'hour' in c.lower() or 'hora' in c.lower()]
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            col_agrupar = st.selectbox(
-                "1. Agrupar datos por (Ej: Nombres, Proyectos):", 
-                cols_texto, 
-                index=cols_texto.index(def_agrupar) if def_agrupar in cols_texto else 0
-            )
-        with col2:
-            cols_graficar = st.multiselect(
-                "2. Valores a sumar y graficar (Ej: Horas Totales):", 
-                cols_numeros,
-                default=def_graficar if def_graficar else [cols_numeros[-1]]
-            )
+        # --- SECCIÓN: GRÁFICOS EJECUTIVOS ---
+        row1_col1, row1_col2 = st.columns((3, 2))
 
-        # Si el usuario seleccionó qué graficar
-        if col_agrupar and cols_graficar:
-            # Agrupar y sumar
-            df_grouped = df.groupby(col_agrupar)[cols_graficar].sum().reset_index()
-            
-            # Limpiar filas de "Subtotales" que los reportes suelen traer al final
-            df_grouped = df_grouped[~df_grouped[col_agrupar].astype(str).str.contains('Subtotal|Total', case=False, na=False)]
-            
-            # Mostrar métricas rápidas de lo que seleccionó
-            st.markdown("### Resumen")
-            metric_cols = st.columns(len(cols_graficar))
-            for i, col_num in enumerate(cols_graficar):
-                total = df_grouped[col_num].sum()
-                metric_cols[i].metric(f"Total {col_num}", f"{total:,.2f}")
+        with row1_col1:
+            st.markdown("#### ⏳ Distribución de Horas por Consultor")
+            if col_billable and col_non_billable:
+                # Preparamos los datos para un gráfico de barras apiladas
+                df_chart = df[[owner_col, col_billable, col_non_billable]].copy()
+                df_chart = df_chart.melt(id_vars=[owner_col], value_vars=[col_billable, col_non_billable], 
+                                         var_name='Tipo de Hora', value_name='Horas')
+                
+                # Renombrar para que se vea limpio en el gráfico
+                df_chart['Tipo de Hora'] = df_chart['Tipo de Hora'].apply(lambda x: 'Billable' if 'non' not in x.lower() else 'Non-Billable')
+                
+                fig_hours = px.bar(
+                    df_chart, 
+                    x=owner_col, 
+                    y='Horas', 
+                    color='Tipo de Hora',
+                    barmode='stack',
+                    color_discrete_map={'Billable': '#27ae60', 'Non-Billable': '#e74c3c'},
+                    template='plotly_white'
+                )
+                fig_hours.update_layout(xaxis_title="Consultor", yaxis_title="Suma de Horas", legend_title=None, margin=dict(t=20))
+                st.plotly_chart(fig_hours, use_container_width=True)
+            else:
+                st.info("No se detectaron columnas claras de Billable/Non-Billable para generar este gráfico.")
 
-            # Mostrar Gráfico
-            fig = px.bar(
-                df_grouped.sort_values(by=cols_graficar[0], ascending=False), 
-                x=col_agrupar, 
-                y=cols_graficar,
-                barmode='group',
-                template="plotly_white",
-                title=f"Suma de valores por {col_agrupar}"
-            )
-            fig.update_layout(legend_title_text='Métricas')
-            st.plotly_chart(fig, use_container_width=True)
+        with row1_col2:
+            st.markdown("#### 🎯 Team Utilization por Consultor")
+            if col_utilization:
+                df_util = df[[owner_col, col_utilization]].copy()
+                df_util['Utilización (%)'] = df_util[col_utilization] * 100
+                df_util = df_util.sort_values(by='Utilización (%)', ascending=True)
+
+                fig_util = px.bar(
+                    df_util, 
+                    x='Utilización (%)', 
+                    y=owner_col, 
+                    orientation='h',
+                    text_auto='.1f',
+                    color='Utilización (%)',
+                    color_continuous_scale='Blues',
+                    template='plotly_white'
+                )
+                fig_util.update_layout(xaxis_title="%", yaxis_title="", coloraxis_showscale=False, margin=dict(t=20))
+                st.plotly_chart(fig_util, use_container_width=True)
+            else:
+                st.info("No se detectó la columna 'Team Utilization'.")
+
+        # --- SECCIÓN: TABLA DETALLADA ---
+        with st.expander("📄 Ver Matriz de Datos Extraída", expanded=False):
+            st.markdown("Esta es la tabla procesada y limpiada a partir de tu reporte original.")
+            # Aplicar formato de % a la columna de utilización si existe
+            format_dict = {}
+            if col_utilization:
+                format_dict[col_utilization] = '{:.1%}'
+            st.dataframe(df.style.format(format_dict), use_container_width=True)
 
     else:
-        st.info("👈 Sube tu archivo a la izquierda para comenzar.")
+        st.info("👈 Sube tu exportación semanal a la izquierda para generar el reporte ejecutivo.")
 
 if __name__ == "__main__":
     main()
